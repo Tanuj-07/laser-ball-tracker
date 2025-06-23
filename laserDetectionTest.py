@@ -1,266 +1,298 @@
+import sys
 import cv2
 import numpy as np
+import threading
 
-# ─────────────────────────────────────────────────────────────────────────────
-#  LASER DETECTION TEST FILE
-#  Red laser dot on white wall, calibration use.
+from PyQt5.QtWidgets import (
+    QApplication, QWidget, QVBoxLayout, QHBoxLayout,
+    QLabel, QSlider, QGroupBox, QFrame
+)
+from PyQt5.QtCore import Qt
+from PyQt5.QtGui import QFont
+
+# laser detection tuning tool — used once to find good detection params,
+# then those values get hardcoded into calibration.py
+# brightness threshold + SimpleBlobDetector (Method D)
 #
-#  Four detection methods. switch with keyboard:
-#    1   Method A: HSV color filter only
-#    2   Method B: Brightness (V channel) threshold only
-#    3   Method C: HSV AND brightness combined
-#    4   Method D: Brightness threshold + SimpleBlobDetector  <- DEFAULT (predicted best)
-#
-#  Press Q to quit.
-#
-# ─────────────────────────────────────────────────────────────────────────────
+# install: pip install PyQt5 opencv-python
+# run:     python laser_detection_D_qt.py
 
-def nothing(x):
-    pass
+# slider definitions: (label, description, min, max, default, scale)
+# scale: shown value = slider_int / scale
+SLIDERS = {
+    "brightness": [
+        ("Brightness Threshold", "Pixels brighter than this survive the mask.\nRaise until only the laser dot appears in the Mask window.\nLower if the dot disappears.", 0, 255, 186, 1),
+    ],
+    "size": [
+        ("Min Area (px²)", "Minimum blob size in pixels².\nKeep low so the dot isn't filtered out at distance.", 1, 300, 20, 1),
+        ("Max Area (px²)", "Maximum blob size in pixels².\nDrag down to reject large blobs like door cracks or lights.", 1, 2000, 48, 1),
+    ],
+    "shape": [
+        ("Min Circularity", "How round the blob must be (0.0-1.0).\n1.0 = perfect circle. A line of light scores ~0.0.", 0, 100, 66, 100),
+        ("Min Convexity", "How convex the blob must be (0.0-1.0).\nCurrently unused, convexity filter is off.", 0, 100, 60, 100),
+        ("Min Inertia Ratio", "How elongated the blob can be (0.0-1.0).\n1.0 = circle, 0.0 = line. Helps reject door crack light.", 0, 100, 37, 100),
+    ],
+}
 
-# ── WINDOWS ──────────────────────────────────────────────────────────────────
-cv2.namedWindow("Trackbars", cv2.WINDOW_NORMAL)
-cv2.resizeWindow("Trackbars", 800, 400)
-cv2.namedWindow("Feed")
-cv2.namedWindow("Mask")
 
-# ── HSV TRACKBARS (Methods A, B, C) ──────────────────────────────────────────
-# Red wraps around the HSV hue boundary — it lives at BOTH H 0-10 AND H 170-179.
-# Two inRange() calls are required; their masks are combined with bitwise_or.
-cv2.createTrackbar("H Low Max",    "Trackbars", 10,  30,  nothing)
-cv2.createTrackbar("H High Min",   "Trackbars", 160, 179, nothing)
-cv2.createTrackbar("S Min",        "Trackbars", 100, 255, nothing)
-cv2.createTrackbar("S Max",        "Trackbars", 255, 255, nothing)
-cv2.createTrackbar("V Min HSV",    "Trackbars", 180, 255, nothing)
-cv2.createTrackbar("V Max HSV",    "Trackbars", 255, 255, nothing)
+class LabeledSlider(QWidget):
+    def __init__(self, label, description, min_val, max_val, default, scale):
+        super().__init__()
+        self.scale = scale
 
-# ── BRIGHTNESS TRACKBAR (Methods B, C, D) ────────────────────────────────────
-# Laser dot is almost always the brightest point in frame.
-# Raise until only the dot survives. Start around 240 for an indoor laser.
-cv2.createTrackbar("V Bright Min", "Trackbars", 200, 255, nothing)
+        layout = QVBoxLayout()
+        layout.setSpacing(2)
+        layout.setContentsMargins(0, 6, 0, 6)
 
-# ── BLOB DETECTOR TRACKBARS (Method D) ───────────────────────────────────────
-# SimpleBlobDetector works on integer trackbar values — all floats are
-# encoded as integer * scale factor, then divided back inside the loop.
-#
-# Min/Max Area: laser dot at 1-2m is roughly 5-50 px^2. Raise Max Area
-#   if the dot is large (close range). Lower Min Area if it disappears.
-# Circularity x100: 100 = perfect circle. Laser dot should be ~85-100.
-#   Lower if the dot appears slightly elliptical due to angle.
-# Convexity x100: 100 = fully convex. Laser dot is always fully convex.
-# Inertia x100: measures elongation. 100 = circle, 0 = line.
-#   Laser dot should be ~80-100. Lower only if dot is being missed.
-cv2.createTrackbar("Blob MinArea",    "Trackbars", 1,   300, nothing)  # px^2 — low: dot is small at 10ft
-cv2.createTrackbar("Blob MaxArea",    "Trackbars", 500, 2000, nothing) # px^2 — generous upper bound
-cv2.createTrackbar("Circ x100",       "Trackbars", 50,  100, nothing)  # /100 = min circularity — loosened for elliptical dot
-cv2.createTrackbar("Conv x100",       "Trackbars", 60,  100, nothing)  # /100 = min convexity — loosened
-cv2.createTrackbar("Inertia x100",    "Trackbars", 30,  100, nothing)  # /100 = min inertia ratio — loosened for non-circular dot
+        top = QHBoxLayout()
+        name_label = QLabel(label)
+        name_label.setFont(QFont("Segoe UI", 10, QFont.Bold))
+        name_label.setStyleSheet("color: #e0e0e0;")
 
-# ── STATE ─────────────────────────────────────────────────────────────────────
-method = 4  # start on Method D
-kernel_small = np.ones((3, 3), np.uint8)  # small kernel — laser dot is tiny
+        self.value_label = QLabel(self._fmt(default))
+        self.value_label.setFont(QFont("Segoe UI Mono", 10))
+        self.value_label.setStyleSheet("color: #64d2ff;")
+        self.value_label.setAlignment(Qt.AlignRight)
 
-cap = cv2.VideoCapture(2)  # change index if your camera is on a different port
+        top.addWidget(name_label)
+        top.addWidget(self.value_label)
 
-print("=" * 55)
-print("  Laser Detection Test")
-print("  1 → Method A: HSV only")
-print("  2 → Method B: Brightness only")
-print("  3 → Method C: HSV + Brightness")
-print("  4 → Method D: Blob detector (default, best)")
-print("  Q → Quit")
-print("=" * 55)
+        desc_label = QLabel(description)
+        desc_label.setFont(QFont("Segoe UI", 8))
+        desc_label.setStyleSheet("color: #888888;")
+        desc_label.setWordWrap(True)
 
-while True:
-    ret, frame = cap.read()
-    if not ret:
-        break
+        self.slider = QSlider(Qt.Horizontal)
+        self.slider.setMinimum(min_val)
+        self.slider.setMaximum(max_val)
+        self.slider.setValue(default)
+        self.slider.setStyleSheet("""
+            QSlider::groove:horizontal {
+                height: 4px;
+                background: #3a3a3a;
+                border-radius: 2px;
+            }
+            QSlider::handle:horizontal {
+                background: #64d2ff;
+                width: 14px;
+                height: 14px;
+                margin: -5px 0;
+                border-radius: 7px;
+            }
+            QSlider::sub-page:horizontal {
+                background: #2a6fa8;
+                border-radius: 2px;
+            }
+        """)
+        self.slider.valueChanged.connect(self._on_change)
 
-    h, w = frame.shape[:2]
+        layout.addLayout(top)
+        layout.addWidget(desc_label)
+        layout.addWidget(self.slider)
+        self.setLayout(layout)
 
-    # ── READ TRACKBARS ────────────────────────────────────────────────────────
-    h_low_max  = cv2.getTrackbarPos("H Low Max",    "Trackbars")
-    h_high_min = cv2.getTrackbarPos("H High Min",   "Trackbars")
-    s_min      = cv2.getTrackbarPos("S Min",        "Trackbars")
-    s_max      = cv2.getTrackbarPos("S Max",        "Trackbars")
-    v_min_hsv  = cv2.getTrackbarPos("V Min HSV",    "Trackbars")
-    v_max_hsv  = cv2.getTrackbarPos("V Max HSV",    "Trackbars")
-    v_bright   = cv2.getTrackbarPos("V Bright Min", "Trackbars")
+    def _fmt(self, val):
+        if self.scale == 1:
+            return str(val)
+        return f"{val / self.scale:.2f}"
 
-    blob_min_area  = max(1, cv2.getTrackbarPos("Blob MinArea",  "Trackbars"))
-    blob_max_area  = max(2, cv2.getTrackbarPos("Blob MaxArea",  "Trackbars"))
-    min_circ       = cv2.getTrackbarPos("Circ x100",  "Trackbars") / 100.0
-    min_conv       = cv2.getTrackbarPos("Conv x100",  "Trackbars") / 100.0
-    min_inertia    = cv2.getTrackbarPos("Inertia x100","Trackbars") / 100.0
+    def _on_change(self, val):
+        self.value_label.setText(self._fmt(val))
 
-    # ── HSV CONVERSION ────────────────────────────────────────────────────────
-    hsv = cv2.cvtColor(frame, cv2.COLOR_BGR2HSV)
+    def get_value(self):
+        return self.slider.value() / self.scale
 
-    # ── BUILD COMPONENT MASKS ─────────────────────────────────────────────────
 
-    # HSV mask — two ranges ORed to handle red's wrap-around at hue 0/179
-    mask_hsv_low  = cv2.inRange(hsv,
-                                np.array([0,          s_min, v_min_hsv]),
-                                np.array([h_low_max,  s_max, v_max_hsv]))
-    mask_hsv_high = cv2.inRange(hsv,
-                                np.array([h_high_min, s_min, v_min_hsv]),
-                                np.array([179,        s_max, v_max_hsv]))
-    mask_hsv = cv2.bitwise_or(mask_hsv_low, mask_hsv_high)
+class ControlPanel(QWidget):
+    def __init__(self):
+        super().__init__()
+        self.setWindowTitle("Laser Detection Controls")
+        self.setMinimumWidth(420)
+        self.setStyleSheet("background-color: #1e1e1e;")
 
-    # Brightness mask — keep only pixels brighter than threshold
-    v_channel = hsv[:, :, 2]
-    _, mask_bright = cv2.threshold(v_channel, v_bright, 255, cv2.THRESH_BINARY)
+        main_layout = QVBoxLayout()
+        main_layout.setSpacing(10)
+        main_layout.setContentsMargins(16, 16, 16, 16)
 
-    # Combined mask — must pass both color AND brightness
-    mask_combined = cv2.bitwise_and(mask_hsv, mask_bright)
+        title = QLabel("Laser Dot Detection - Method D")
+        title.setFont(QFont("Segoe UI", 13, QFont.Bold))
+        title.setStyleSheet("color: #ffffff; padding-bottom: 4px;")
+        main_layout.addWidget(title)
 
-    # ── SELECT ACTIVE MASK AND RUN DETECTION ──────────────────────────────────
-    detected  = False
-    dot_x = dot_y = dot_r = 0
+        subtitle = QLabel("Brightness threshold + SimpleBlobDetector")
+        subtitle.setFont(QFont("Segoe UI", 9))
+        subtitle.setStyleSheet("color: #666666; padding-bottom: 8px;")
+        main_layout.addWidget(subtitle)
 
-    if method == 1:
-        # ── METHOD A: HSV only ────────────────────────────────────────────────
-        mask = mask_hsv.copy()
-        mask = cv2.erode(mask,  kernel_small, iterations=1)
-        mask = cv2.dilate(mask, kernel_small, iterations=1)
-        method_label = "A: HSV only"
+        line = QFrame()
+        line.setFrameShape(QFrame.HLine)
+        line.setStyleSheet("color: #333333;")
+        main_layout.addWidget(line)
 
-        contours, _ = cv2.findContours(mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
-        if contours:
-            largest = max(contours, key=cv2.contourArea)
-            if cv2.contourArea(largest) >= 3:
-                (x, y), radius = cv2.minEnclosingCircle(largest)
-                dot_x, dot_y, dot_r = int(x), int(y), max(int(radius), 3)
-                detected = True
+        self.status_label = QLabel("● NO DETECTION")
+        self.status_label.setFont(QFont("Segoe UI", 10, QFont.Bold))
+        self.status_label.setStyleSheet("color: #ff4444; padding: 6px 0;")
+        main_layout.addWidget(self.status_label)
 
-    elif method == 2:
-        # ── METHOD B: Brightness only ─────────────────────────────────────────
-        mask = mask_bright.copy()
-        mask = cv2.erode(mask,  kernel_small, iterations=1)
-        mask = cv2.dilate(mask, kernel_small, iterations=1)
-        method_label = "B: Brightness only"
+        self.coord_label = QLabel("")
+        self.coord_label.setFont(QFont("Segoe UI Mono", 9))
+        self.coord_label.setStyleSheet("color: #aaaaaa;")
+        main_layout.addWidget(self.coord_label)
 
-        contours, _ = cv2.findContours(mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
-        if contours:
-            largest = max(contours, key=cv2.contourArea)
-            if cv2.contourArea(largest) >= 3:
-                (x, y), radius = cv2.minEnclosingCircle(largest)
-                dot_x, dot_y, dot_r = int(x), int(y), max(int(radius), 3)
-                detected = True
+        line2 = QFrame()
+        line2.setFrameShape(QFrame.HLine)
+        line2.setStyleSheet("color: #333333;")
+        main_layout.addWidget(line2)
 
-    elif method == 3:
-        # ── METHOD C: HSV + Brightness combined ───────────────────────────────
-        mask = mask_combined.copy()
-        mask = cv2.erode(mask,  kernel_small, iterations=1)
-        mask = cv2.dilate(mask, kernel_small, iterations=1)
-        method_label = "C: HSV + Brightness"
+        group_titles = {"brightness": "Brightness Filter", "size": "Blob Size", "shape": "Blob Shape"}
+        group_colors = {"brightness": "#a78bfa", "size": "#34d399", "shape": "#64d2ff"}
 
-        contours, _ = cv2.findContours(mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
-        if contours:
-            largest = max(contours, key=cv2.contourArea)
-            if cv2.contourArea(largest) >= 3:
-                (x, y), radius = cv2.minEnclosingCircle(largest)
-                dot_x, dot_y, dot_r = int(x), int(y), max(int(radius), 3)
-                detected = True
+        self.sliders = {}
+        for group_key, slider_defs in SLIDERS.items():
+            group_box = QGroupBox(group_titles[group_key])
+            color = group_colors[group_key]
+            group_box.setStyleSheet(f"""
+                QGroupBox {{
+                    font: bold 10pt "Segoe UI";
+                    color: {color};
+                    border: 1px solid #333333;
+                    border-radius: 6px;
+                    margin-top: 10px;
+                    padding: 8px;
+                }}
+                QGroupBox::title {{
+                    subcontrol-origin: margin;
+                    left: 10px;
+                    padding: 0 4px;
+                }}
+            """)
+            group_layout = QVBoxLayout()
+            group_layout.setSpacing(4)
+            for (label, desc, mn, mx, default, scale) in slider_defs:
+                s = LabeledSlider(label, desc, mn, mx, default, scale)
+                group_layout.addWidget(s)
+                self.sliders[label] = s
+            group_box.setLayout(group_layout)
+            main_layout.addWidget(group_box)
 
-    else:
-        # ── METHOD D: Brightness threshold + SimpleBlobDetector ───────────────
-        # Step 1: threshold first to give the blob detector a clean binary image.
-        # Invert it — SimpleBlobDetector looks for DARK blobs on a light background
-        # by default when filterByColor is off. Inverting the bright mask means
-        # the laser dot becomes a dark blob on a white field, which is what the
-        # detector expects. blobColor=0 confirms this.
-        mask = mask_bright.copy()
-        mask_inverted = cv2.bitwise_not(mask)
-        method_label = "D: Blob Detector (best)"
+        main_layout.addStretch()
+        hint = QLabel("OpenCV windows: Feed (camera) · Mask (threshold)\nPress Q in Feed or Mask to quit.")
+        hint.setFont(QFont("Segoe UI", 8))
+        hint.setStyleSheet("color: #555555; padding-top: 8px;")
+        main_layout.addWidget(hint)
+        self.setLayout(main_layout)
 
-        # Step 2: build detector from current trackbar values every frame
-        # so you can tune live without restarting.
+    def get_params(self):
+        s = self.sliders
+        return {
+            "v_bright":      int(s["Brightness Threshold"].get_value()),
+            "blob_min_area": max(1, int(s["Min Area (px²)"].get_value())),
+            "blob_max_area": max(2, int(s["Max Area (px²)"].get_value())),
+            "min_circ":      s["Min Circularity"].get_value(),
+            "min_conv":      s["Min Convexity"].get_value(),
+            "min_inertia":   s["Min Inertia Ratio"].get_value(),
+        }
+
+    def set_detection(self, detected, dot_x=0, dot_y=0, dot_r=0):
+        if detected:
+            self.status_label.setText("● DETECTED")
+            self.status_label.setStyleSheet("color: #22c55e; padding: 6px 0;")
+            self.coord_label.setText(f"x={dot_x}  y={dot_y}  r={dot_r}")
+        else:
+            self.status_label.setText("● NO DETECTION")
+            self.status_label.setStyleSheet("color: #ff4444; padding: 6px 0;")
+            self.coord_label.setText("")
+
+
+def run_camera(panel):
+    cap = cv2.VideoCapture(2)
+
+    # lock exposure so auto-exposure doesn't shift brightness between frames
+    # 1 = manual, 3 = auto (varies by driver)
+    cap.set(cv2.CAP_PROP_AUTO_EXPOSURE, 1)
+    cap.set(cv2.CAP_PROP_EXPOSURE, -6)  # tune if feed is too dark/bright
+
+    while True:
+        ret, frame = cap.read()
+        if not ret:
+            break
+
+        h, w = frame.shape[:2]
+        p = panel.get_params()
+
+        # zero out saturation so detection is purely brightness-based,
+        # not affected by color casts or white balance
+        hsv = cv2.cvtColor(frame, cv2.COLOR_BGR2HSV)
+        hsv[:, :, 1] = 0
+        v_channel = hsv[:, :, 2]
+        _, mask_bright = cv2.threshold(v_channel, p["v_bright"], 255, cv2.THRESH_BINARY)
+
+        # dilate to fatten the dot so the blob detector can grab it,
+        # and to merge fragmented noise into one large blob that gets rejected by Max Area
+        kernel_small = np.ones((3, 3), np.uint8)
+        mask_bright = cv2.dilate(mask_bright, kernel_small, iterations=1)
+
+        # invert since SimpleBlobDetector looks for dark blobs on a light background
+        mask_inverted = cv2.bitwise_not(mask_bright)
+
+        # circularity and inertia filters reject the door crack light (which is a line,
+        # so it scores near 0 on both). laser dot scores much higher on both.
         params = cv2.SimpleBlobDetector_Params()
-
-        params.filterByColor    = True
-        params.blobColor        = 0      # detect dark blobs (laser dot is dark after invert)
-
-        params.filterByArea     = True
-        params.minArea          = blob_min_area
-        params.maxArea          = blob_max_area
-
-        params.filterByCircularity = True
-        params.minCircularity   = min_circ
-        params.maxCircularity   = 1.0   # perfect circle is always valid
-
-        params.filterByConvexity = True
-        params.minConvexity     = min_conv
-        params.maxConvexity     = 1.0
-
-        params.filterByInertia  = True
-        params.minInertiaRatio  = min_inertia
-        params.maxInertiaRatio  = 1.0
+        params.filterByColor = True;  params.blobColor = 0
+        params.filterByArea = True;   params.minArea = p["blob_min_area"]; params.maxArea = p["blob_max_area"]
+        params.filterByCircularity = True;  params.minCircularity = p["min_circ"]; params.maxCircularity = 1.0
+        params.filterByConvexity = False
+        params.filterByInertia = True;  params.minInertiaRatio = p["min_inertia"]; params.maxInertiaRatio = 1.0
 
         detector = cv2.SimpleBlobDetector_create(params)
         keypoints = detector.detect(mask_inverted)
 
+        detected = False
+        dot_x = dot_y = dot_r = 0
+
         if keypoints:
-            # if multiple blobs survive all filters, take the brightest one.
-            # "Brightest" = lowest mean value in the original V channel at that location,
-            # since we inverted — the original hottest spot maps to the darkest blob.
-            # In practice this is rarely more than one keypoint.
-            best = min(keypoints,
-                       key=lambda kp: v_channel[int(kp.pt[1]), int(kp.pt[0])])
-            dot_x  = int(best.pt[0])
-            dot_y  = int(best.pt[1])
-            dot_r  = max(int(best.size / 2), 3)
+            best = min(keypoints, key=lambda kp: v_channel[int(kp.pt[1]), int(kp.pt[0])])
+            dot_x = int(best.pt[0])
+            dot_y = int(best.pt[1])
+            dot_r = max(int(best.size / 2), 3)
             detected = True
 
-        # show the inverted mask in the Mask window for Method D
-        mask = mask_inverted
+        panel.set_detection(detected, dot_x, dot_y, dot_r)
 
-    # ── DRAW ──────────────────────────────────────────────────────────────────
-    display = frame.copy()
+        display = frame.copy()
+        if detected:
+            cv2.circle(display, (dot_x, dot_y), dot_r, (0, 255, 0), 1)
+            cv2.circle(display, (dot_x, dot_y), 3, (0, 0, 255), -1)
+            cv2.line(display, (dot_x - 20, dot_y), (dot_x + 20, dot_y), (0, 255, 255), 1)
+            cv2.line(display, (dot_x, dot_y - 20), (dot_x, dot_y + 20), (0, 255, 255), 1)
+            cv2.putText(display, f"({dot_x}, {dot_y})  r={dot_r}", (dot_x + 10, dot_y - 10),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.45, (0, 255, 0), 1)
+        else:
+            cv2.putText(display, "NO DETECTION", (10, h - 15),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 0, 255), 2)
 
-    if detected:
-        # enclosing circle
-        cv2.circle(display, (dot_x, dot_y), dot_r, (0, 255, 0), 1)
-        # center dot
-        cv2.circle(display, (dot_x, dot_y), 3, (0, 0, 255), -1)
-        # crosshair — useful for judging accuracy during calibration
-        cv2.line(display, (dot_x - 20, dot_y), (dot_x + 20, dot_y), (0, 255, 255), 1)
-        cv2.line(display, (dot_x, dot_y - 20), (dot_x, dot_y + 20), (0, 255, 255), 1)
+        status_color = (0, 200, 0) if detected else (0, 0, 200)
+        cv2.rectangle(display, (w - 30, 5), (w - 5, 30), status_color, -1)
 
-        coord_label = f"({dot_x}, {dot_y})  r={dot_r}"
-        cv2.putText(display, coord_label, (dot_x + 10, dot_y - 10),
-                    cv2.FONT_HERSHEY_SIMPLEX, 0.45, (0, 255, 0), 1)
-    else:
-        cv2.putText(display, "NO DETECTION", (10, h - 15),
-                    cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 0, 255), 2)
+        cv2.imshow("Feed", display)
+        cv2.imshow("Mask", mask_inverted)
 
-    # method label — top left
-    cv2.putText(display, method_label, (10, 25),
-                cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 255, 0), 2)
+        if cv2.waitKey(1) & 0xFF == ord('q'):
+            break
 
-    # status indicator box — top right corner, green = detected, red = not
-    status_color = (0, 200, 0) if detected else (0, 0, 200)
-    cv2.rectangle(display, (w - 30, 5), (w - 5, 30), status_color, -1)
+    cap.release()
+    cv2.destroyAllWindows()
 
-    cv2.imshow("Feed",    display)
-    cv2.imshow("Mask",    mask)
 
-    # ── INPUT ─────────────────────────────────────────────────────────────────
-    key = cv2.waitKey(1) & 0xFF
-    if key == ord('q'):
-        break
-    elif key == ord('1'):
-        method = 1
-        print("→ Method A: HSV only")
-    elif key == ord('2'):
-        method = 2
-        print("→ Method B: Brightness only")
-    elif key == ord('3'):
-        method = 3
-        print("→ Method C: HSV + Brightness")
-    elif key == ord('4'):
-        method = 4
-        print("→ Method D: Blob Detector")
+if __name__ == "__main__":
+    app = QApplication(sys.argv)
+    app.setStyle("Fusion")
 
-cap.release()
-cv2.destroyAllWindows()
+    panel = ControlPanel()
+    panel.show()
+
+    # camera loop runs in a background thread so the Qt UI stays responsive
+    cam_thread = threading.Thread(target=run_camera, args=(panel,), daemon=True)
+    cam_thread.start()
+
+    sys.exit(app.exec_())
