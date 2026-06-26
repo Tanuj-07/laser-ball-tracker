@@ -4,9 +4,8 @@ Real time tennis ball tracking system using a webcam, OpenCV, and a calibrated p
 
 A camera detects a tennis ball using HSV color filtering and a Kalman filter predicts its position to compensate for hardware latency. The predicted pixel position is converted to servo angles using a bilinear calibration model (created with calibration routine), making a red laser dot mounted on a pan-tilt turret to follow the ball in real time.
 
-## Demo
-
-
+## Demo (click to view video)
+[![Demo Video](https://img.youtube.com/vi/t4fFL6wskiE/maxresdefault.jpg)](https://youtu.be/t4fFL6wskiE)
 
 ## Hardware
 
@@ -49,12 +48,9 @@ The Arduino receives pan and tilt angles over serial and interpolates smoothly t
 **Install all Python dependencies:**
 - `pip install opencv-python pyserial PyQt5 numpy`
 
-
-
-
 **Arduino:**
 - Arduino IDE
-- Upload `servo_controller.ino` to the Uno R3 using the Arduino IDE. Requires the `Adafruit PWM Servo Driver` library. Install it via the Arduino Library Manager.
+- Upload `servo_control.ino` to the Uno R3 using the Arduino IDE. Requires the `Adafruit PWM Servo Driver` library. Install it via the Arduino Library Manager.
 
 ## Usage
 
@@ -77,7 +73,7 @@ Run in this order:
 - `calibration.py` : calibration routine, generates `calibration_data.json`
 - `widgets.py` : PyQt5 UI components for the ball tracker control panel
 - `laserDetectionTest.py` : one time tuning tool for laser detection parameters, needs to be adjusted based on lighting
-- `servo_controller.ino` : Arduino sketch, handles smooth servo interpolation over serial
+- `servo_control.ino` : Arduino sketch, handles smooth servo interpolation over serial
 
 
 
