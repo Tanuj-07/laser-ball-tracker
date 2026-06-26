@@ -4,6 +4,10 @@ Real time tennis ball tracking system using a webcam, OpenCV, and a calibrated p
 
 A camera detects a tennis ball using HSV color filtering and a Kalman filter predicts its position to compensate for hardware latency. The predicted pixel position is converted to servo angles using a bilinear calibration model (created with calibration routine), making a red laser dot mounted on a pan-tilt turret to follow the ball in real time.
 
+## What does it look like?
+<img width="440" alt="9B49C1DC-C833-45B7-89A8-A23782BEBE7F" src="https://github.com/user-attachments/assets/d7421f0e-fb54-4535-8d4a-20a29562f657" />
+
+
 ## Demo (click to view video)
 [![Demo Video](https://img.youtube.com/vi/t4fFL6wskiE/maxresdefault.jpg)](https://youtu.be/t4fFL6wskiE)
 
